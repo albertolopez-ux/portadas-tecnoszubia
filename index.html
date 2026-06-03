@@ -179,7 +179,7 @@
 
     <div id="map-box" hidden>
       <label class="check"><input type="checkbox" id="has-header" checked> La primera fila son los nombres de columna</label>
-      <div class="hint">Asigna cada campo a una columna de tu hoja. «(ninguna)» usa el valor del formulario de arriba.</div>
+      <div class="hint">Asigna cada campo a una columna de tu hoja. «(ninguna)» usa el valor del formulario de arriba. Si el número y el título van juntos en una celda (ej. «Tema 4. …»), asígnala a cualquiera de los dos: se separan solos.</div>
       <div class="map-grid">
         <div class="field"><label>Nº de tema</label><select id="map-num"></select></div>
         <div class="field"><label>Título</label><select id="map-titulo"></select></div>
@@ -714,17 +714,35 @@ function readMapping(){
   return {map, hasHeader: $('has-header').checked};
 }
 
+// Separa número y título cuando vienen juntos en una celda (ej. "Tema 4. La propiedad…")
+function normalizeNumTitle(num, titulo){
+  num = (num || '').trim(); titulo = (titulo || '').trim();
+  // Si el campo "número" no es un número puro, extrae el nº y usa el resto como título
+  if(num && !/^\d+$/.test(num)){
+    const m = num.match(/\d+/);
+    if(!titulo) titulo = num.replace(/^\s*(?:tema\s*)?\d+\s*[.\-:)º]*\s*/i, '').trim();
+    num = m ? m[0] : '';
+  }
+  // Si el título empieza por "Tema N." quita ese prefijo (y toma el nº si falta)
+  const tm = titulo.match(/^\s*tema\s*(\d+)\s*[.\-:)]\s*(.+)$/i);
+  if(tm){ if(!num) num = tm[1]; titulo = tm[2].trim(); }
+  return {num, titulo};
+}
+
 function buildTopics(){
   const {map, hasHeader} = readMapping();
   const data = hasHeader ? sheetRows.slice(1) : sheetRows;
   const get = (row, i) => (i >= 0 && row[i] != null) ? String(row[i]).trim() : '';
-  return data.map(row => ({
-    num: get(row, map.num),
-    titulo: get(row, map.titulo),
-    rev: get(row, map.rev),
-    curso: get(row, map.curso),
-    esp: get(row, map.esp)
-  })).filter(t => t.num || t.titulo);
+  return data.map(row => {
+    const nt = normalizeNumTitle(get(row, map.num), get(row, map.titulo));
+    return {
+      num: nt.num,
+      titulo: nt.titulo,
+      rev: get(row, map.rev),
+      curso: get(row, map.curso),
+      esp: get(row, map.esp)
+    };
+  }).filter(t => t.num || t.titulo);
 }
 
 function updatePreview(){
