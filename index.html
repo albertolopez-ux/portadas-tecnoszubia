@@ -64,8 +64,13 @@
     cursor:pointer;background:#16336b;color:#fff;transition:.15s;
   }
   .btn:hover{background:#1f4488}
+  .btn:disabled{background:#aeb8c9;cursor:not-allowed}
   .btn.ghost{background:#eef1f5;color:#16336b}
   .btn.ghost:hover{background:#e2e8f2}
+  .sep{border:none;border-top:1px solid #e2e6ec;margin:6px 0 2px}
+  .batch-title{font-weight:700;font-size:14px;color:#16336b}
+  .drop.small{padding:14px 12px;font-size:12px}
+  .hint a{color:#2E74B5;font-weight:600}
   .status{font-size:12px;color:#5b6b86;min-height:16px}
   .status.ok{color:#1a8a4a}
   .status.err{color:#c0392b}
@@ -155,6 +160,17 @@
     <button id="pdf" class="btn">⬇  Descargar PDF</button>
     <button id="print" class="btn ghost">🖨  Imprimir (texto vectorial)</button>
     <div class="hint"><b>Descargar PDF</b>: genera el archivo directamente con los colores y el fondo exactos, sin tocar el diálogo. <br><b>Imprimir</b>: usa el diálogo del navegador (texto seleccionable); activa «Gráficos de fondo».</div>
+
+    <hr class="sep">
+    <div class="batch-title">📚 Generar todas las portadas (lote)</div>
+    <div id="sheet-drop" class="drop small">
+      <b>Arrastra una hoja de cálculo</b><br>
+      .xlsx o .csv (Excel / Google Sheets)
+      <input id="sheet-file" type="file" accept=".xlsx,.csv" hidden>
+    </div>
+    <div class="hint">Columnas: <b>Tema</b> (nº), <b>Título</b>, <b>Revisión</b>, <b>Curso</b> y, opcionalmente, <b>Especialidad</b>. Si faltan Revisión/Curso/Especialidad, se usan los del formulario de arriba. <a href="#" id="tpl">Descargar plantilla</a></div>
+    <div id="batch-status" class="status"></div>
+    <button id="zip" class="btn" disabled>🗜  Descargar ZIP con todas las portadas</button>
 
     <div class="spacer"></div>
     <div class="foot">Las portadas usan la tipografía <b>Clash Grotesk</b>. Si está instalada en tu equipo, el PDF saldrá idéntico al original.</div>
@@ -473,31 +489,259 @@ function downloadBlob(blob, name){
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
 }
 
-function generatePdf(){
+// Dibuja la portada actual (según la vista previa) en un canvas a 300 DPI
+function renderCanvas(){
+  const page = $('page');
+  const DPI = 300;
+  const scale = (210/25.4*DPI) / page.offsetWidth;
+  const cw = Math.round(page.offsetWidth*scale), ch = Math.round(page.offsetHeight*scale);
+  const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage($('bg'), 0, 0, cw, ch);
+  drawField(ctx, $('prev-esp'), scale);
+  drawTema(ctx, $('prev-tema'), scale);
+  drawRev(ctx, $('prev-rev'), scale);
+  return {cv, cw, ch};
+}
+// Genera el PDF de la portada actual como Blob
+function canvasToPdfBlob(){
+  const {cv, cw, ch} = renderCanvas();
+  return new Promise(res => cv.toBlob(async blob => {
+    const jpeg = new Uint8Array(await blob.arrayBuffer());
+    res(buildPdf(jpeg, cw, ch));
+  }, 'image/jpeg', 0.95));
+}
+
+async function generatePdf(){
   const st = $('status'); st.className = 'status'; st.textContent = 'Generando PDF…';
   try{
-    const page = $('page');
-    const DPI = 300;
-    const scale = (210/25.4*DPI) / page.offsetWidth;   // canvas px por px de layout
-    const cw = Math.round(page.offsetWidth*scale), ch = Math.round(page.offsetHeight*scale);
-    const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
-    const ctx = cv.getContext('2d');
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage($('bg'), 0, 0, cw, ch);
-    drawField(ctx, $('prev-esp'), scale);
-    drawTema(ctx, $('prev-tema'), scale);
-    drawRev(ctx, $('prev-rev'), scale);
-    cv.toBlob(async blob => {
-      const jpeg = new Uint8Array(await blob.arrayBuffer());
-      downloadBlob(buildPdf(jpeg, cw, ch), fileName());
-      st.className = 'status ok'; st.textContent = '✓ PDF descargado.';
-    }, 'image/jpeg', 0.95);
+    const blob = await canvasToPdfBlob();
+    downloadBlob(blob, fileName());
+    st.className = 'status ok'; st.textContent = '✓ PDF descargado.';
   }catch(e){
     st.className = 'status err'; st.textContent = 'Error al generar el PDF: ' + e.message;
   }
 }
 
 $('pdf').addEventListener('click', generatePdf);
+
+/* ===================================================================
+   MODO LOTE: hoja de cálculo (.xlsx / .csv) → ZIP con un PDF por tema
+   =================================================================== */
+
+// ---- CRC32 y escritor de ZIP (sin compresión, sin librerías) ----
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for(let n = 0; n < 256; n++){ let c = n; for(let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(u8){ let c = 0xFFFFFFFF; for(let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+
+function makeZip(files){
+  const enc = new TextEncoder(); const chunks = []; let offset = 0; const central = [];
+  const u16 = v => new Uint8Array([v & 255, (v >> 8) & 255]);
+  const u32 = v => new Uint8Array([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255]);
+  const push = b => { chunks.push(b); offset += b.length; };
+  const DATE = 33, TIME = 0; // 1980-01-01
+  for(const f of files){
+    const name = enc.encode(f.name), data = f.data, crc = crc32(data), localOff = offset;
+    push(u32(0x04034b50)); push(u16(20)); push(u16(0)); push(u16(0)); push(u16(TIME)); push(u16(DATE));
+    push(u32(crc)); push(u32(data.length)); push(u32(data.length));
+    push(u16(name.length)); push(u16(0)); push(name); push(data);
+    central.push({name, crc, size: data.length, localOff});
+  }
+  const cdStart = offset;
+  for(const c of central){
+    push(u32(0x02014b50)); push(u16(20)); push(u16(20)); push(u16(0)); push(u16(0)); push(u16(TIME)); push(u16(DATE));
+    push(u32(c.crc)); push(u32(c.size)); push(u32(c.size));
+    push(u16(c.name.length)); push(u16(0)); push(u16(0)); push(u16(0)); push(u16(0)); push(u32(0));
+    push(u32(c.localOff)); push(c.name);
+  }
+  const cdSize = offset - cdStart;
+  push(u32(0x06054b50)); push(u16(0)); push(u16(0)); push(u16(central.length)); push(u16(central.length));
+  push(u32(cdSize)); push(u32(cdStart)); push(u16(0));
+  let total = 0; for(const c of chunks) total += c.length;
+  const out = new Uint8Array(total); let p = 0; for(const c of chunks){ out.set(c, p); p += c.length; }
+  return new Blob([out], {type:'application/zip'});
+}
+
+// ---- Lectura de hoja de cálculo ----
+function zipList(buf){
+  const dv = new DataView(buf), u8 = new Uint8Array(buf); const names = [];
+  let eocd = -1; for(let i = u8.length - 22; i >= 0; i--){ if(dv.getUint32(i, true) === 0x06054b50){ eocd = i; break; } }
+  if(eocd < 0) return names;
+  let off = dv.getUint32(eocd + 16, true); const total = dv.getUint16(eocd + 10, true);
+  for(let n = 0; n < total; n++){
+    if(dv.getUint32(off, true) !== 0x02014b50) break;
+    const nameLen = dv.getUint16(off + 28, true), extraLen = dv.getUint16(off + 30, true), commLen = dv.getUint16(off + 32, true);
+    names.push(new TextDecoder().decode(u8.subarray(off + 46, off + 46 + nameLen)));
+    off += 46 + nameLen + extraLen + commLen;
+  }
+  return names;
+}
+function colToIndex(ref){ if(!ref) return 0; let n = 0; for(const ch of ref) n = n*26 + (ch.charCodeAt(0) - 64); return n - 1; }
+
+async function parseXlsx(buf){
+  const list = zipList(buf);
+  const sheet = list.find(n => /^xl\/worksheets\/sheet1\.xml$/.test(n)) || list.find(n => /^xl\/worksheets\/sheet\d+\.xml$/.test(n));
+  if(!sheet) throw new Error('No se encontró ninguna hoja en el Excel');
+  const sheetXml = await readEntry(buf, sheet);
+  const shared = [];
+  if(list.includes('xl/sharedStrings.xml')){
+    const ss = await readEntry(buf, 'xl/sharedStrings.xml');
+    const siRe = /<si>([\s\S]*?)<\/si>/g; let m;
+    while((m = siRe.exec(ss))){
+      const ts = [...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(x => x[1]).join('');
+      shared.push(decodeEntities(ts));
+    }
+  }
+  const rows = [];
+  const rowRe = /<row[^>]*>([\s\S]*?)<\/row>/g; let r;
+  while((r = rowRe.exec(sheetXml))){
+    const cells = [];
+    const cRe = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g; let cm;
+    while((cm = cRe.exec(r[1]))){
+      const attrs = cm[1] || '', body = cm[2] || '';
+      const ref = (attrs.match(/r="([A-Z]+)\d+"/) || [])[1] || '';
+      const col = colToIndex(ref);
+      const t = (attrs.match(/t="([^"]+)"/) || [])[1];
+      const vm = body.match(/<v>([\s\S]*?)<\/v>/);
+      let val = '';
+      if(t === 's') val = shared[parseInt(vm ? vm[1] : '-1', 10)] || '';
+      else if(t === 'inlineStr'){ const im = body.match(/<t[^>]*>([\s\S]*?)<\/t>/); val = im ? decodeEntities(im[1]) : ''; }
+      else val = vm ? decodeEntities(vm[1]) : '';
+      cells[col >= 0 ? col : cells.length] = val;
+    }
+    for(let i = 0; i < cells.length; i++) if(cells[i] === undefined) cells[i] = '';
+    rows.push(cells);
+  }
+  return rows.filter(row => row.some(c => String(c).trim() !== ''));
+}
+
+function parseCSV(text){
+  text = text.replace(/\r\n?/g, '\n');
+  const first = text.split('\n')[0] || '';
+  const counts = {',':0, ';':0, '\t':0};
+  for(const ch of first) if(ch in counts) counts[ch]++;
+  const delim = Object.keys(counts).reduce((a, b) => counts[b] > counts[a] ? b : a, ',');
+  const rows = []; let row = [], field = '', inq = false;
+  for(let i = 0; i < text.length; i++){
+    const c = text[i];
+    if(inq){ if(c === '"'){ if(text[i+1] === '"'){ field += '"'; i++; } else inq = false; } else field += c; }
+    else if(c === '"') inq = true;
+    else if(c === delim){ row.push(field); field = ''; }
+    else if(c === '\n'){ row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => c.trim() !== ''));
+}
+
+const norm = s => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').trim();
+
+function rowsToTopics(rows){
+  if(!rows.length) return [];
+  const idx = {num:-1, titulo:-1, rev:-1, curso:-1, esp:-1};
+  rows[0].forEach((h, i) => {
+    const n = norm(h);
+    if(idx.esp < 0 && n.includes('especialidad')) idx.esp = i;
+    else if(idx.rev < 0 && n.includes('revis')) idx.rev = i;
+    else if(idx.curso < 0 && n.includes('curso')) idx.curso = i;
+    else if(idx.titulo < 0 && (n.includes('titulo') || n.includes('nombre') || n.includes('denominacion') || n.includes('enunciado'))) idx.titulo = i;
+    else if(idx.num < 0 && (n.includes('num') || n === 'tema' || n === 'n' || n === 'no' || n.includes('orden'))) idx.num = i;
+  });
+  const hasHeader = idx.num >= 0 && idx.titulo >= 0;
+  if(!hasHeader){ idx.num = 0; idx.titulo = 1; idx.rev = 2; idx.curso = 3; idx.esp = 4; }
+  const data = hasHeader ? rows.slice(1) : rows;
+  const get = (row, i) => (i >= 0 && row[i] != null) ? String(row[i]).trim() : '';
+  return data.map(row => ({
+    num: get(row, idx.num),
+    titulo: get(row, idx.titulo),
+    rev: get(row, idx.rev),
+    curso: get(row, idx.curso),
+    esp: get(row, idx.esp)
+  })).filter(t => t.num || t.titulo);
+}
+
+let batchTopics = [];
+
+async function loadSheet(file){
+  const st = $('batch-status'); st.className = 'status'; st.textContent = 'Leyendo «' + file.name + '»…';
+  try{
+    let rows;
+    if(/\.csv$/i.test(file.name)) rows = parseCSV(await file.text());
+    else if(/\.xlsx$/i.test(file.name)) rows = await parseXlsx(await file.arrayBuffer());
+    else throw new Error('Formato no soportado. Usa .xlsx o .csv (en Google Sheets: Archivo → Descargar → .xlsx o .csv)');
+    batchTopics = rowsToTopics(rows);
+    if(!batchTopics.length) throw new Error('No se detectaron temas en la hoja');
+    st.className = 'status ok';
+    st.textContent = '✓ ' + batchTopics.length + ' temas detectados.';
+    $('zip').disabled = false;
+  }catch(e){
+    batchTopics = []; $('zip').disabled = true;
+    st.className = 'status err'; st.textContent = 'Error: ' + e.message;
+  }
+}
+
+function setFields(t, defEsp){
+  inputs.esp.value = t.esp || defEsp || '';
+  inputs.num.value = t.num || '';
+  inputs.titulo.value = t.titulo || '';
+  inputs.rev.value = t.rev || inputs.rev.value;
+  inputs.curso.value = t.curso || inputs.curso.value;
+  render();
+}
+
+function sanitize(s){ return (s || '').replace(/[\\/:*?"<>|\n\r\t]/g,' ').replace(/\s+/g,' ').trim().replace(/[.\s]+$/,''); }
+
+async function generateZip(){
+  if(!batchTopics.length) return;
+  const st = $('batch-status'); $('zip').disabled = true;
+  const snapshot = {esp:inputs.esp.value, num:inputs.num.value, titulo:inputs.titulo.value, rev:inputs.rev.value, curso:inputs.curso.value};
+  const defEsp = snapshot.esp, defRev = snapshot.rev, defCurso = snapshot.curso;
+  try{
+    const files = []; const used = new Set();
+    for(let i = 0; i < batchTopics.length; i++){
+      const t = batchTopics[i];
+      setFields({...t, rev: t.rev || defRev, curso: t.curso || defCurso}, defEsp);
+      await new Promise(r => requestAnimationFrame(r)); // asegurar el relayout
+      const blob = await canvasToPdfBlob();
+      let base = sanitize([t.num ? 'Tema ' + t.num : '', t.titulo].filter(Boolean).join(' - ')).slice(0, 80) || ('portada-' + (i+1));
+      let name = base + '.pdf', k = 2;
+      while(used.has(name.toLowerCase())){ name = base + ' (' + (k++) + ').pdf'; }
+      used.add(name.toLowerCase());
+      files.push({name, data: new Uint8Array(await blob.arrayBuffer())});
+      st.className = 'status'; st.textContent = 'Generando portadas… ' + (i+1) + '/' + batchTopics.length;
+    }
+    downloadBlob(makeZip(files), 'portadas.zip');
+    st.className = 'status ok'; st.textContent = '✓ ZIP descargado con ' + files.length + ' portadas.';
+  }catch(e){
+    st.className = 'status err'; st.textContent = 'Error al generar el ZIP: ' + e.message;
+  }finally{
+    // restaurar el formulario al estado previo
+    inputs.esp.value = snapshot.esp; inputs.num.value = snapshot.num; inputs.titulo.value = snapshot.titulo;
+    inputs.rev.value = snapshot.rev; inputs.curso.value = snapshot.curso; render();
+    $('zip').disabled = false;
+  }
+}
+
+function downloadTemplate(){
+  const csv = 'Tema;Titulo;Revision;Curso;Especialidad\n'
+    + '1;El Derecho: concepto. Clasificación.;18;2025/2026;Administración de Empresas\n'
+    + '2;La Constitución Española de 1978.;18;2025/2026;Administración de Empresas\n';
+  downloadBlob(new Blob([csv], {type:'text/csv;charset=utf-8'}), 'plantilla-temas.csv');
+}
+
+// Eventos del modo lote
+const sheetDrop = $('sheet-drop'), sheetInput = $('sheet-file');
+sheetDrop.addEventListener('click', () => sheetInput.click());
+sheetInput.addEventListener('change', e => { if(e.target.files[0]) loadSheet(e.target.files[0]); });
+['dragenter','dragover'].forEach(ev => sheetDrop.addEventListener(ev, e => { e.preventDefault(); sheetDrop.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => sheetDrop.addEventListener(ev, e => { e.preventDefault(); sheetDrop.classList.remove('drag'); }));
+sheetDrop.addEventListener('drop', e => { const fl = e.dataTransfer.files; if(fl && fl[0]) loadSheet(fl[0]); });
+$('zip').addEventListener('click', generateZip);
+$('tpl').addEventListener('click', downloadTemplate);
 $('print').addEventListener('click', () => window.print());
 
 /* ====== Init ====== */
