@@ -71,6 +71,12 @@
   .batch-title{font-weight:700;font-size:14px;color:#16336b}
   .drop.small{padding:14px 12px;font-size:12px}
   .hint a{color:#2E74B5;font-weight:600}
+  #map-box{display:flex;flex-direction:column;gap:10px;background:#f7f9fc;border:1px solid #e2e6ec;border-radius:10px;padding:12px}
+  .check{font-size:12px;color:#3a4759;display:flex;align-items:center;gap:7px;cursor:pointer}
+  .map-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 10px}
+  .map-grid .field label{font-size:11px}
+  .map-grid select{border:1px solid #cfd7e3;border-radius:7px;padding:7px 8px;font:inherit;font-size:12px;background:#fff;color:#1d2733;width:100%}
+  #map-preview{background:#eef5ff;border-radius:7px;padding:8px 10px;color:#2c4a73}
   .status{font-size:12px;color:#5b6b86;min-height:16px}
   .status.ok{color:#1a8a4a}
   .status.err{color:#c0392b}
@@ -168,8 +174,22 @@
       .xlsx o .csv (Excel / Google Sheets)
       <input id="sheet-file" type="file" accept=".xlsx,.csv" hidden>
     </div>
-    <div class="hint">Columnas: <b>Tema</b> (nº), <b>Título</b>, <b>Revisión</b>, <b>Curso</b> y, opcionalmente, <b>Especialidad</b>. Si faltan Revisión/Curso/Especialidad, se usan los del formulario de arriba. <a href="#" id="tpl">Descargar plantilla</a></div>
+    <div class="hint">Columnas recomendadas: <b>Tema</b> (nº), <b>Título</b>, <b>Revisión</b>, <b>Curso</b> y <b>Especialidad</b>. <a href="#" id="tpl">Descargar plantilla</a></div>
     <div id="batch-status" class="status"></div>
+
+    <div id="map-box" hidden>
+      <label class="check"><input type="checkbox" id="has-header" checked> La primera fila son los nombres de columna</label>
+      <div class="hint">Asigna cada campo a una columna de tu hoja. «(ninguna)» usa el valor del formulario de arriba.</div>
+      <div class="map-grid">
+        <div class="field"><label>Nº de tema</label><select id="map-num"></select></div>
+        <div class="field"><label>Título</label><select id="map-titulo"></select></div>
+        <div class="field"><label>Revisión</label><select id="map-rev"></select></div>
+        <div class="field"><label>Curso</label><select id="map-curso"></select></div>
+        <div class="field"><label>Especialidad</label><select id="map-esp"></select></div>
+      </div>
+      <div id="map-preview" class="hint"></div>
+    </div>
+
     <button id="zip" class="btn" disabled>🗜  Descargar ZIP con todas las portadas</button>
 
     <div class="spacer"></div>
@@ -640,31 +660,89 @@ function parseCSV(text){
 
 const norm = s => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').trim();
 
-function rowsToTopics(rows){
-  if(!rows.length) return [];
+// Detecta automáticamente qué columna corresponde a cada campo a partir de las cabeceras
+function autoDetect(headerRow){
   const idx = {num:-1, titulo:-1, rev:-1, curso:-1, esp:-1};
-  rows[0].forEach((h, i) => {
+  const temaCols = [];
+  (headerRow || []).forEach((h, i) => {
     const n = norm(h);
     if(idx.esp < 0 && n.includes('especialidad')) idx.esp = i;
-    else if(idx.rev < 0 && n.includes('revis')) idx.rev = i;
-    else if(idx.curso < 0 && n.includes('curso')) idx.curso = i;
-    else if(idx.titulo < 0 && (n.includes('titulo') || n.includes('nombre') || n.includes('denominacion') || n.includes('enunciado'))) idx.titulo = i;
-    else if(idx.num < 0 && (n.includes('num') || n === 'tema' || n === 'n' || n === 'no' || n.includes('orden'))) idx.num = i;
+    else if(idx.rev < 0 && (n.includes('revis') || n === 'rev')) idx.rev = i;
+    else if(idx.curso < 0 && (n.includes('curso') || n.includes('ano academico') || n.includes('año'))) idx.curso = i;
+    else if(idx.titulo < 0 && (n.includes('titulo') || n.includes('nombre') || n.includes('denominacion') || n.includes('enunciado') || n.includes('epigrafe'))) idx.titulo = i;
+    else if(idx.num < 0 && (n.includes('numero') || n.includes('núm') || n === 'num' || n === 'n' || n === 'nº' || n === 'no' || n.includes('orden'))) idx.num = i;
+    if(n === 'tema' || n === 'temas') temaCols.push(i);
   });
-  const hasHeader = idx.num >= 0 && idx.titulo >= 0;
-  if(!hasHeader){ idx.num = 0; idx.titulo = 1; idx.rev = 2; idx.curso = 3; idx.esp = 4; }
-  const data = hasHeader ? rows.slice(1) : rows;
+  // Resolver columnas llamadas exactamente "tema": si ya hay nº dedicado, es el título; si no, es el número
+  for(const c of temaCols){
+    if(c === idx.num || c === idx.titulo) continue;
+    if(idx.num < 0) idx.num = c;
+    else if(idx.titulo < 0) idx.titulo = c;
+  }
+  return idx;
+}
+
+let sheetRows = [];           // filas crudas de la hoja
+const FIELDS = [['num','Nº de tema'],['titulo','Título'],['rev','Revisión'],['curso','Curso'],['esp','Especialidad']];
+const colLetter = i => { let s = ''; i++; while(i > 0){ s = String.fromCharCode(65 + (i-1)%26) + s; i = Math.floor((i-1)/26); } return s; };
+
+// Rellena los selectores con las columnas de la hoja y aplica la detección automática
+function renderMapUI(){
+  const hasHeader = $('has-header').checked;
+  const ncols = sheetRows.reduce((m, r) => Math.max(m, r.length), 0);
+  const headerRow = sheetRows[0] || [];
+  const auto = hasHeader ? autoDetect(headerRow) : {num:0, titulo:1, rev:2, curso:3, esp:4};
+  FIELDS.forEach(([key]) => {
+    const sel = $('map-' + key);
+    const prev = sel.value;
+    sel.innerHTML = '<option value="-1">— (ninguna) —</option>';
+    for(let i = 0; i < ncols; i++){
+      const label = hasHeader ? (String(headerRow[i] || '').trim() || '(sin nombre)') : 'Columna ' + (i+1);
+      sel.insertAdjacentHTML('beforeend', '<option value="' + i + '">' + colLetter(i) + ': ' + escapeHtml(label) + '</option>');
+    }
+    // mantener selección previa del usuario; si es la primera vez, usar la detección
+    sel.value = (prev !== '' && prev !== null) ? prev : String(auto[key] >= 0 ? auto[key] : -1);
+    if(sel.selectedIndex < 0) sel.value = String(auto[key] >= 0 ? auto[key] : -1);
+  });
+  updatePreview();
+}
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function readMapping(){
+  const map = {};
+  FIELDS.forEach(([key]) => map[key] = parseInt($('map-' + key).value, 10));
+  return {map, hasHeader: $('has-header').checked};
+}
+
+function buildTopics(){
+  const {map, hasHeader} = readMapping();
+  const data = hasHeader ? sheetRows.slice(1) : sheetRows;
   const get = (row, i) => (i >= 0 && row[i] != null) ? String(row[i]).trim() : '';
   return data.map(row => ({
-    num: get(row, idx.num),
-    titulo: get(row, idx.titulo),
-    rev: get(row, idx.rev),
-    curso: get(row, idx.curso),
-    esp: get(row, idx.esp)
+    num: get(row, map.num),
+    titulo: get(row, map.titulo),
+    rev: get(row, map.rev),
+    curso: get(row, map.curso),
+    esp: get(row, map.esp)
   })).filter(t => t.num || t.titulo);
 }
 
-let batchTopics = [];
+function updatePreview(){
+  const topics = buildTopics();
+  const st = $('batch-status'), pv = $('map-preview');
+  if(!topics.length){
+    $('zip').disabled = true;
+    st.className = 'status err'; st.textContent = 'No se detectan temas con este mapeo. Revisa las columnas.';
+    pv.textContent = ''; return;
+  }
+  $('zip').disabled = false;
+  st.className = 'status ok'; st.textContent = '✓ ' + topics.length + ' temas listos.';
+  const t = topics[0];
+  pv.innerHTML = '<b>Ejemplo (1ª fila):</b> ' + escapeHtml(
+    (t.num ? 'Tema ' + t.num + '. ' : '') + (t.titulo || '(sin título)')) +
+    ' · Rev: ' + escapeHtml(t.rev || '—') + ' · Curso: ' + escapeHtml(t.curso || '—') +
+    (t.esp ? ' · ' + escapeHtml(t.esp) : '');
+}
 
 async function loadSheet(file){
   const st = $('batch-status'); st.className = 'status'; st.textContent = 'Leyendo «' + file.name + '»…';
@@ -673,13 +751,14 @@ async function loadSheet(file){
     if(/\.csv$/i.test(file.name)) rows = parseCSV(await file.text());
     else if(/\.xlsx$/i.test(file.name)) rows = await parseXlsx(await file.arrayBuffer());
     else throw new Error('Formato no soportado. Usa .xlsx o .csv (en Google Sheets: Archivo → Descargar → .xlsx o .csv)');
-    batchTopics = rowsToTopics(rows);
-    if(!batchTopics.length) throw new Error('No se detectaron temas en la hoja');
-    st.className = 'status ok';
-    st.textContent = '✓ ' + batchTopics.length + ' temas detectados.';
-    $('zip').disabled = false;
+    if(!rows.length) throw new Error('La hoja está vacía');
+    sheetRows = rows;
+    // resetear selecciones para que se aplique la detección automática
+    FIELDS.forEach(([key]) => $('map-' + key).value = '');
+    $('map-box').hidden = false;
+    renderMapUI();
   }catch(e){
-    batchTopics = []; $('zip').disabled = true;
+    sheetRows = []; $('map-box').hidden = true; $('zip').disabled = true;
     st.className = 'status err'; st.textContent = 'Error: ' + e.message;
   }
 }
@@ -696,14 +775,15 @@ function setFields(t, defEsp){
 function sanitize(s){ return (s || '').replace(/[\\/:*?"<>|\n\r\t]/g,' ').replace(/\s+/g,' ').trim().replace(/[.\s]+$/,''); }
 
 async function generateZip(){
-  if(!batchTopics.length) return;
+  const topics = buildTopics();
+  if(!topics.length) return;
   const st = $('batch-status'); $('zip').disabled = true;
   const snapshot = {esp:inputs.esp.value, num:inputs.num.value, titulo:inputs.titulo.value, rev:inputs.rev.value, curso:inputs.curso.value};
   const defEsp = snapshot.esp, defRev = snapshot.rev, defCurso = snapshot.curso;
   try{
     const files = []; const used = new Set();
-    for(let i = 0; i < batchTopics.length; i++){
-      const t = batchTopics[i];
+    for(let i = 0; i < topics.length; i++){
+      const t = topics[i];
       setFields({...t, rev: t.rev || defRev, curso: t.curso || defCurso}, defEsp);
       await new Promise(r => requestAnimationFrame(r)); // asegurar el relayout
       const blob = await canvasToPdfBlob();
@@ -712,14 +792,13 @@ async function generateZip(){
       while(used.has(name.toLowerCase())){ name = base + ' (' + (k++) + ').pdf'; }
       used.add(name.toLowerCase());
       files.push({name, data: new Uint8Array(await blob.arrayBuffer())});
-      st.className = 'status'; st.textContent = 'Generando portadas… ' + (i+1) + '/' + batchTopics.length;
+      st.className = 'status'; st.textContent = 'Generando portadas… ' + (i+1) + '/' + topics.length;
     }
     downloadBlob(makeZip(files), 'portadas.zip');
     st.className = 'status ok'; st.textContent = '✓ ZIP descargado con ' + files.length + ' portadas.';
   }catch(e){
     st.className = 'status err'; st.textContent = 'Error al generar el ZIP: ' + e.message;
   }finally{
-    // restaurar el formulario al estado previo
     inputs.esp.value = snapshot.esp; inputs.num.value = snapshot.num; inputs.titulo.value = snapshot.titulo;
     inputs.rev.value = snapshot.rev; inputs.curso.value = snapshot.curso; render();
     $('zip').disabled = false;
@@ -741,8 +820,10 @@ sheetInput.addEventListener('change', e => { if(e.target.files[0]) loadSheet(e.t
 ['dragleave','drop'].forEach(ev => sheetDrop.addEventListener(ev, e => { e.preventDefault(); sheetDrop.classList.remove('drag'); }));
 sheetDrop.addEventListener('drop', e => { const fl = e.dataTransfer.files; if(fl && fl[0]) loadSheet(fl[0]); });
 $('zip').addEventListener('click', generateZip);
-$('tpl').addEventListener('click', downloadTemplate);
+$('tpl').addEventListener('click', e => { e.preventDefault(); downloadTemplate(); });
 $('print').addEventListener('click', () => window.print());
+$('has-header').addEventListener('change', renderMapUI);
+FIELDS.forEach(([key]) => $('map-' + key).addEventListener('change', updatePreview));
 
 /* ====== Init ====== */
 render(); fit();
