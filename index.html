@@ -7,10 +7,10 @@
 <style>
   :root{
     /* Posiciones de los campos sobre la portada (ajustables) */
-    --esp-top: 15.5%;
+    --esp-top: 21%;
     --esp-left: 5.0%;
     --esp-width: 90%;
-    --tema-top: 27%;
+    --tema-top: 32%;
     --tema-left: 5.0%;
     --tema-width: 90%;
     --rev-top: 3.3%;
@@ -91,9 +91,11 @@
   }
   .f-tema{
     top:var(--tema-top);left:var(--tema-left);width:var(--tema-width);
-    font-family:'Clash Grotesk Semibold','Clash Grotesk','Helvetica Neue',Arial,sans-serif;
-    font-weight:700;color:var(--azul-tema);font-size:22pt;line-height:1.12;text-align:justify;
+    font-family:'Clash Grotesk','Helvetica Neue',Arial,sans-serif;
+    color:var(--azul-tema);font-size:22pt;line-height:1.12;text-align:justify;
   }
+  .f-tema .tema-num{font-weight:800}   /* "Tema N." resaltado en negrita */
+  .f-tema .tema-tit{font-weight:400}   /* título en peso normal */
   .f-rev{
     top:var(--rev-top);right:var(--rev-right);width:var(--rev-width);height:var(--rev-height);
     display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;
@@ -182,7 +184,16 @@ function render(){
   $('prev-esp').textContent  = inputs.esp.value || '';
   const num = inputs.num.value.trim();
   const tit = inputs.titulo.value.trim();
-  $('prev-tema').textContent = (num ? 'Tema ' + num + '. ' : '') + tit;
+  // "Tema N." en negrita + título en peso normal (dos spans)
+  const tema = $('prev-tema'); tema.textContent = '';
+  if(num){
+    const s = document.createElement('span'); s.className = 'tema-num';
+    s.textContent = 'Tema ' + num + '. '; tema.appendChild(s);
+  }
+  if(tit){
+    const s = document.createElement('span'); s.className = 'tema-tit';
+    s.textContent = tit; tema.appendChild(s);
+  }
   const rev = inputs.rev.value.trim();
   const curso = inputs.curso.value.trim();
   // "Revisión: N" en una línea; "Curso:" y el curso académico en líneas aparte (como el original)
@@ -364,6 +375,45 @@ function drawField(ctx, el, scale){
   });
 }
 
+/* Dibuja el tema respetando dos pesos (Tema N. en negrita + título normal) y la justificación */
+function drawTema(ctx, el, scale){
+  const cs = getComputedStyle(el);
+  const x = el.offsetLeft*scale, yTop = el.offsetTop*scale, w = el.offsetWidth*scale;
+  const fpx = parseFloat(cs.fontSize) * scale;
+  let lh = parseFloat(cs.lineHeight); lh = isNaN(lh) ? fpx*1.2 : lh*scale;
+  const fam = cs.fontFamily, style = cs.fontStyle;
+  ctx.fillStyle = cs.color; ctx.textBaseline = 'top';
+  const justify = cs.textAlign === 'justify';
+  // Palabras con su peso, leídas de cada <span>
+  const words = [];
+  el.querySelectorAll('span').forEach(sp => {
+    const wt = getComputedStyle(sp).fontWeight;
+    sp.textContent.split(/\s+/).filter(Boolean).forEach(t => words.push({t, wt}));
+  });
+  if(!words.length) return;
+  const fontFor = wt => `${style} ${wt} ${fpx}px ${fam}`;
+  const mw = wd => { ctx.font = fontFor(wd.wt); return ctx.measureText(wd.t).width; };
+  ctx.font = fontFor(words[0].wt); const spaceW = ctx.measureText(' ').width;
+  // Ajuste de líneas
+  const lines = []; let cur = [], curW = 0;
+  for(const wd of words){
+    const ww = mw(wd);
+    const add = (cur.length ? spaceW : 0) + ww;
+    if(cur.length && curW + add > w){ lines.push(cur); cur = [wd]; curW = ww; }
+    else { cur.push(wd); curW += add; }
+  }
+  if(cur.length) lines.push(cur);
+  // Pintado
+  lines.forEach((lw, i) => {
+    const y = yTop + i*lh + (lh - fpx)/2;
+    const last = i === lines.length - 1;
+    const wordsW = lw.reduce((s, wd) => s + mw(wd), 0);
+    const gap = (justify && !last && lw.length > 1) ? (w - wordsW)/(lw.length - 1) : spaceW;
+    let cx = x;
+    lw.forEach(wd => { ctx.font = fontFor(wd.wt); ctx.fillText(wd.t, cx, y); cx += ctx.measureText(wd.t).width + gap; });
+  });
+}
+
 function drawRev(ctx, el, scale){
   const text = el.textContent;
   if(!text.trim()) return;
@@ -435,7 +485,7 @@ function generatePdf(){
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage($('bg'), 0, 0, cw, ch);
     drawField(ctx, $('prev-esp'), scale);
-    drawField(ctx, $('prev-tema'), scale);
+    drawTema(ctx, $('prev-tema'), scale);
     drawRev(ctx, $('prev-rev'), scale);
     cv.toBlob(async blob => {
       const jpeg = new Uint8Array(await blob.arrayBuffer());
